@@ -24,7 +24,7 @@ const LANGUAGES_API = `${BASE_URL}/api/frontend/episode/%s/languages`;
 const DUB_CODES = new Set(['eng', 'en', 'en-us', 'english', 'dub']);
 
 // Dub-only module returns a single stream, so a provider-style name is noise.
-const STREAM_LABEL = 'English Dub';
+const STREAM_LABEL = 'English';
 
 /* MAIN FUNCTIONS */
 
