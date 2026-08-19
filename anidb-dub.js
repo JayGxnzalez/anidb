@@ -23,6 +23,9 @@ const LANGUAGES_API = `${BASE_URL}/api/frontend/episode/%s/languages`;
 // languages API, so 'eng' here is the English DUB track (jpn == sub).
 const DUB_CODES = new Set(['eng', 'en', 'en-us', 'english', 'dub']);
 
+// Dub-only module returns a single stream, so a provider-style name is noise.
+const STREAM_LABEL = 'English Dub';
+
 /* MAIN FUNCTIONS */
 
 /**
@@ -149,11 +152,16 @@ async function extractStreamUrl(url) {
         const rawLangs = (data && (Array.isArray(data.languages) ? data.languages : Array.isArray(data.data) ? data.data : Array.isArray(data.streams) ? data.streams : [])) || [];
         if (!Array.isArray(rawLangs)) return JSON.stringify(emptyStreamResult());
 
+        // Log the raw shape once so we can see whether anidb ships subtitle
+        // tracks in this JSON (like AnimexOne's `tracks`) rather than in the embed.
+        try { console.log('[AniDB-DUB] languages raw: ' + JSON.stringify(rawLangs).substring(0, 700)); } catch (e) {}
+
         const languages = rawLangs
             .map((lang) => ({
                 code: (lang.code || lang.language || '').toLowerCase(),
                 name: lang.name || lang.label,
-                embed_url: lang.embed_url || lang.url || lang.file
+                embed_url: lang.embed_url || lang.url || lang.file,
+                raw: lang
             }))
             .filter((l) => l.code && l.embed_url);
 
@@ -164,6 +172,9 @@ async function extractStreamUrl(url) {
         // Resolve every dub embed in parallel -> master playlist + subtitle tracks.
         const resolved = await Promise.all(dubLangs.map(async (lang) => {
             try {
+                // Subs may come from the languages API itself (AnimexOne-style)
+                // or from the embed's player config. Take both.
+                const apiSubs = subsFromApiEntry(lang.raw);
                 const { master, subs } = await resolveEmbed(lang.embed_url);
                 if (!master) return null;
                 return {
@@ -171,7 +182,7 @@ async function extractStreamUrl(url) {
                     streamUrl: master,
                     headers: makeStreamHeaders(),
                     language: lang.code,
-                    subs: subs || []
+                    subs: apiSubs.concat(subs || [])
                 };
             } catch (e) {
                 console.log('Embed resolve error: ' + (lang.code || lang.name) + ' -> ' + e);
@@ -198,17 +209,21 @@ async function extractStreamUrl(url) {
                 seenSub.add(sub.url);
                 allSubtitles.push({
                     url: sub.url,
-                    label: sub.label || 'Subtitle',
+                    label: cleanText(sub.label || 'Subtitle'),
                     kind: sub.kind || 'captions',
-                    headers: makeStreamHeaders()
+                    headers: makeStreamHeaders(),
+                    isDefault: !!sub.isDefault
                 });
             });
         });
 
         const primary = pickPrimarySub(allSubtitles);
+        const primaryUrl = primary ? primary.url : '';
+        console.log('[AniDB-DUB] streams=' + streams.length + ' subs=' + allSubtitles.length);
         return JSON.stringify({
             streams: streams,
-            subtitles: primary ? primary.url : '',
+            subtitle: primaryUrl,
+            subtitles: primaryUrl,
             subtitlesHeaders: primary ? primary.headers : makeStreamHeaders(),
             allSubtitles: allSubtitles
         });
@@ -220,8 +235,38 @@ async function extractStreamUrl(url) {
 
 /* HELPERS */
 
+// Shirox logs read `currentStream.subtitle` (singular) alongside
+// `currentStream.allSubtitles`, so emit both spellings of the primary key.
 function emptyStreamResult() {
-    return { streams: [], subtitles: '', subtitlesHeaders: {}, allSubtitles: [] };
+    return { streams: [], subtitle: '', subtitles: '', subtitlesHeaders: {}, allSubtitles: [] };
+}
+
+// Pull subtitle tracks straight off a languages-API entry, the way AnimexOne
+// reads `data.tracks`. Checks the field names anidb plausibly uses and
+// filters out thumbnail/preview tracks.
+function subsFromApiEntry(raw) {
+    const out = [];
+    if (!raw || typeof raw !== 'object') return out;
+
+    const candidates = [raw.tracks, raw.subtitles, raw.subs, raw.captions, raw.subtitle_tracks];
+    candidates.forEach((list) => {
+        if (!Array.isArray(list)) return;
+        list.forEach((t) => {
+            if (!t) return;
+            const url = typeof t === 'string' ? t : (t.url || t.file || t.src);
+            if (!url) return;
+            const kind = String((typeof t === 'object' && (t.kind || t.type)) || '').toLowerCase();
+            if (kind && /thumbnail|preview|sprite|chapter/.test(kind)) return;
+            out.push({
+                url: decodeHtml(url),
+                label: (typeof t === 'object' && (t.label || t.name || t.lang || t.language)) || 'Subtitle',
+                kind: kind && /caption|subtitle|sub/.test(kind) ? kind : 'captions',
+                isDefault: !!(typeof t === 'object' && t.default)
+            });
+        });
+    });
+
+    return out;
 }
 
 function isDub(lang) {
@@ -308,21 +353,16 @@ function extractSubtitleTracks(html) {
 }
 
 // Choose the default/primary track: prefer an English label, else the first.
+// Precedence mirrors AnimexOne: explicit default -> English -> first available.
 function pickPrimarySub(list) {
     if (!list || list.length === 0) return null;
-    const eng = list.find((s) => /eng/i.test(s.label));
-    return eng || list[0];
+    return list.find((s) => s.isDefault)
+        || list.find((s) => /^en$/i.test(s.label) || /eng/i.test(s.label))
+        || list[0];
 }
 
 function prettifyLangLabel(lang) {
-    const map = {
-        eng: 'English (DUB)',
-        en: 'English (DUB)',
-        'en-us': 'English (DUB)'
-    };
-    if (map[lang.code]) return map[lang.code];
-    if (lang.name) return lang.name;
-    return (lang.code || 'English').toUpperCase() + ' (DUB)';
+    return STREAM_LABEL;
 }
 
 function parseBrowseCards(html) {
