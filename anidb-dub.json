@@ -1,0 +1,20 @@
+{
+    "sourceName": "AniDB DUB",
+    "iconUrl": "https://anidb.app/images/fav-512.png",
+    "author": {
+        "name": "Jay",
+        "icon": "https://avatars.githubusercontent.com/JayGxnzalez?s=400",
+        "url": "https://github.com/JayGxnzalez"
+    },
+    "version": "1.0.0",
+    "language": "English",
+    "streamType": "HLS",
+    "quality": "1080p",
+    "baseUrl": "https://anidb.app/",
+    "searchBaseUrl": "https://anidb.app/browse?q=%s&sort=order_top",
+    "scriptUrl": "https://raw.githubusercontent.com/JayGxnzalez/anidb/refs/heads/main/anidb-dub.js",
+    "type": "anime",
+    "downloadSupport": true,
+    "asyncJS": true,
+    "softsub": true
+}
