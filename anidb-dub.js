@@ -24,7 +24,7 @@ const LANGUAGES_API = `${BASE_URL}/api/frontend/episode/%s/languages`;
 const DUB_CODES = new Set(['eng', 'en', 'en-us', 'english', 'dub']);
 
 // Dub-only module returns a single stream, so a provider-style name is noise.
-const STREAM_LABEL = 'English';
+const STREAM_LABEL = 'English Dub';
 
 /* MAIN FUNCTIONS */
 
@@ -177,12 +177,15 @@ async function extractStreamUrl(url) {
                 const apiSubs = subsFromApiEntry(lang.raw);
                 const { master, subs } = await resolveEmbed(lang.embed_url);
                 if (!master) return null;
+                // Aniyomi's AniDB source hands the master playlist to PlaylistUtils,
+                // which reads #EXT-X-MEDIA:TYPE=SUBTITLES entries. Do the same.
+                const hlsSubs = await subsFromMasterPlaylist(master);
                 return {
                     title: prettifyLangLabel(lang),
                     streamUrl: master,
                     headers: makeStreamHeaders(),
                     language: lang.code,
-                    subs: apiSubs.concat(subs || [])
+                    subs: apiSubs.concat(subs || []).concat(hlsSubs || [])
                 };
             } catch (e) {
                 console.log('Embed resolve error: ' + (lang.code || lang.name) + ' -> ' + e);
@@ -267,6 +270,58 @@ function subsFromApiEntry(raw) {
     });
 
     return out;
+}
+
+// Read #EXT-X-MEDIA:TYPE=SUBTITLES entries out of an HLS master playlist.
+// This is where anidb actually exposes its subtitle tracks.
+async function subsFromMasterPlaylist(masterUrl) {
+    const out = [];
+    try {
+        if (!masterUrl) return out;
+        const response = await soraFetch(masterUrl);
+        if (!response) return out;
+        const text = await response.text();
+        if (!text || text.indexOf('EXT-X-MEDIA') === -1) return out;
+
+        const seen = {};
+        const lineRe = /#EXT-X-MEDIA:([^\n\r]*TYPE=SUBTITLES[^\n\r]*)/gi;
+        let m;
+        while ((m = lineRe.exec(text)) !== null) {
+            const attrs = m[1];
+            const uri = extractFirst(attrs, /URI="([^"]+)"/i);
+            if (!uri) continue;
+
+            const abs = resolveUrl(masterUrl, decodeHtml(uri));
+            if (seen[abs]) continue;
+            seen[abs] = true;
+
+            const name = extractFirst(attrs, /NAME="([^"]+)"/i);
+            const lang = extractFirst(attrs, /LANGUAGE="([^"]+)"/i);
+            const isDefault = /DEFAULT=YES/i.test(attrs);
+
+            out.push({
+                url: abs,
+                label: cleanText(name || lang || 'Subtitle'),
+                kind: 'captions',
+                isDefault: isDefault
+            });
+        }
+    } catch (e) {
+        console.log('Master playlist subtitle parse error: ' + e);
+    }
+    return out;
+}
+
+// Resolve a possibly-relative playlist URI against the master playlist URL.
+function resolveUrl(baseUrl, uri) {
+    if (/^https?:\/\//i.test(uri)) return uri;
+    const base = String(baseUrl || '');
+    if (uri.charAt(0) === '/') {
+        const originMatch = base.match(/^(https?:\/\/[^/]+)/i);
+        return originMatch ? originMatch[1] + uri : uri;
+    }
+    const dir = base.replace(/[?#].*$/, '').replace(/\/[^/]*$/, '/');
+    return dir + uri;
 }
 
 function isDub(lang) {
