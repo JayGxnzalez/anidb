@@ -108,9 +108,12 @@ async function extractEpisodes(url) {
         const animeId = parseAnimeId(url);
         if (!animeId) return JSON.stringify([]);
 
-        // Slug is already in the anime URL — carry it plus the episode number on
-        // the href so extractStreamUrl can look up subtitles without extra fetches.
+        // Slug is already in the anime URL — carry title, season and a RELATIVE
+        // episode number on the href so extractStreamUrl can look up subtitles
+        // without extra fetches.
         const slug = parseAnimeSlug(url);
+        const season = parseSeasonFromSlug(slug);
+        const searchTitle = slugToTitle(slug);
 
         const response = await soraFetch(EPISODES_API.replace('%s', animeId));
         if (!response) return JSON.stringify([]);
@@ -119,13 +122,24 @@ async function extractEpisodes(url) {
         const rawEpisodes = (data && (Array.isArray(data.episodes) ? data.episodes : Array.isArray(data.data) ? data.data : Array.isArray(data.list) ? data.list : [])) || [];
         if (!Array.isArray(rawEpisodes)) return JSON.stringify([]);
 
+        // anidb uses ABSOLUTE numbering on split-cour shows (Attack on Titan S2
+        // is 26..37). Subtitle sites index by season-relative number, so derive
+        // an offset from the lowest episode, matching what the Aniyomi source does.
+        let minNumber = 0;
+        rawEpisodes.forEach((ep, index) => {
+            const n = ep && ep.number !== undefined ? parseInt(ep.number, 10) : index + 1;
+            if (!isNaN(n) && (minNumber === 0 || n < minNumber)) minNumber = n;
+        });
+        const offset = minNumber > 1 ? minNumber - 1 : 0;
+
         const episodes = rawEpisodes
             .map((ep, index) => {
                 const number = ep.number !== undefined ? parseInt(ep.number, 10) : index + 1;
                 const epId = ep.id || ep.episode_id || ep.episodeId;
                 if (isNaN(number) || !epId) return null;
+                const relative = number - offset;
                 return {
-                    href: `${BASE_URL}/episode/${epId}?t=${encodeURIComponent(slug)}&n=${number}`,
+                    href: `${BASE_URL}/episode/${epId}?t=${encodeURIComponent(searchTitle)}&s=${season}&n=${relative}`,
                     number: number
                 };
             })
@@ -384,17 +398,34 @@ function parseEpisodeMeta(url) {
     const s = String(url || '');
     const slug = extractFirst(s, /[?&]t=([^&]+)/);
     const num = extractFirst(s, /[?&]n=(\d+)/);
+    const season = extractFirst(s, /[?&]s=(\d+)/);
     return {
-        title: slug ? slugToTitle(decodeURIComponent(slug)) : '',
+        title: slug ? decodeURIComponent(slug) : '',
+        season: season ? parseInt(season, 10) : 1,
         episode: num ? parseInt(num, 10) : 0
     };
 }
 
 function slugToTitle(slug) {
     return String(slug || '')
-        .replace(/-\d+$/, '')      // trailing anidb id
+        .replace(/-\d+$/, '')                              // trailing anidb id
+        .replace(/-(?:season|part|cour)-\d+$/i, '')        // season suffix
+        .replace(/-(?:season|part|cour)-[a-z]+$/i, '')     // "-season-two"
         .replace(/-/g, ' ')
         .trim();
+}
+
+// anidb slugs carry the season in the name ("attack-on-titan-season-2-459").
+function parseSeasonFromSlug(slug) {
+    const s = String(slug || '').replace(/-\d+$/, '');
+    const num = s.match(/-(?:season|part|cour)-(\d{1,2})$/i);
+    if (num) return parseInt(num[1], 10);
+
+    const words = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 };
+    const word = s.match(/-(?:season|part|cour)-([a-z]+)$/i);
+    if (word && words[word[1].toLowerCase()]) return words[word[1].toLowerCase()];
+
+    return 1;
 }
 
 // Single request, English only, no size-measuring downloads (that's the
@@ -403,8 +434,10 @@ async function fetchExternalSubs(meta) {
     try {
         if (!meta || !meta.title || !meta.episode) return [];
 
-        const q = encodeURIComponent(meta.title).replace(/%20/g, '%20');
-        const url = `${OS_REST}/episode-${meta.episode}/query-${q}/sublanguageid-eng`;
+        // OS REST expects '+' between query words, and a season segment.
+        const q = meta.title.replace(/[^a-z0-9 ]/gi, ' ').trim().replace(/\s+/g, '+');
+        if (!q) return [];
+        const url = `${OS_REST}/episode-${meta.episode}/query-${q}/season-${meta.season}/sublanguageid-eng`;
 
         const response = await soraFetch(url, {
             headers: {
@@ -417,9 +450,24 @@ async function fetchExternalSubs(meta) {
         });
         if (!response) return [];
 
+        // OS REST answers with an HTML error page on a bad/throttled query.
+        // Sniff the body first — calling .json() on HTML throws a SyntaxError
+        // that the engine surfaces as an [Error] line even when caught.
+        let body;
+        try { body = await response.text(); } catch (e) { return []; }
+        if (!body) return [];
+        const trimmed = body.replace(/^\uFEFF/, '').replace(/^\s+/, '');
+        if (trimmed.charAt(0) !== '[' && trimmed.charAt(0) !== '{') {
+            console.log('[AniDB-DUB] ext subs: non-JSON response, skipping');
+            return [];
+        }
+
         let rows;
-        try { rows = await response.json(); } catch (e) { return []; }
-        if (!Array.isArray(rows) || rows.length === 0) return [];
+        try { rows = JSON.parse(trimmed); } catch (e) { return []; }
+        if (!Array.isArray(rows) || rows.length === 0) {
+            console.log('[AniDB-DUB] ext subs: no rows for s' + meta.season + 'e' + meta.episode + ' "' + meta.title + '"');
+            return [];
+        }
 
         const scored = [];
         rows.forEach((row) => {
@@ -430,10 +478,13 @@ async function fetchExternalSubs(meta) {
             // Episode validation (reference doc §5): a parsed code that
             // disagrees with the request is dropped outright. Unparseable
             // names are allowed but always lose to a verified match.
+            // Season is only enforced when the name actually carries one that
+            // conflicts — anime releases often omit or renumber seasons.
             let epRank;
-            if (parsed && parsed.e === meta.episode) epRank = 2;     // verified
-            else if (parsed) return;                                 // blocked
-            else epRank = 1;                                         // unknown
+            if (parsed && parsed.e === meta.episode && parsed.s === meta.season) epRank = 3; // exact
+            else if (parsed && parsed.e === meta.episode) epRank = 2;                        // ep matches
+            else if (parsed) return;                                                          // blocked
+            else epRank = 1;                                                                  // unknown
 
             // Signs/songs detection: trust the API flag first, fall back to
             // the release name.
