@@ -108,6 +108,10 @@ async function extractEpisodes(url) {
         const animeId = parseAnimeId(url);
         if (!animeId) return JSON.stringify([]);
 
+        // Slug is already in the anime URL — carry it plus the episode number on
+        // the href so extractStreamUrl can look up subtitles without extra fetches.
+        const slug = parseAnimeSlug(url);
+
         const response = await soraFetch(EPISODES_API.replace('%s', animeId));
         if (!response) return JSON.stringify([]);
         const data = await response.json();
@@ -121,7 +125,7 @@ async function extractEpisodes(url) {
                 const epId = ep.id || ep.episode_id || ep.episodeId;
                 if (isNaN(number) || !epId) return null;
                 return {
-                    href: `${BASE_URL}/episode/${epId}`,
+                    href: `${BASE_URL}/episode/${epId}?t=${encodeURIComponent(slug)}&n=${number}`,
                     number: number
                 };
             })
@@ -168,6 +172,13 @@ async function extractStreamUrl(url) {
         // DUB-ONLY: keep English-dub audio tracks only.
         const dubLangs = languages.filter(isDub);
         if (dubLangs.length === 0) return JSON.stringify(emptyStreamResult());
+
+        // Kick the external subtitle lookup off NOW so it overlaps the embed +
+        // master-playlist fetches below. Total cost is max(streams, subs), not
+        // the sum. Sora has no setTimeout, so there's no timer to race against —
+        // overlapping the work IS the speed strategy.
+        const meta = parseEpisodeMeta(url);
+        const externalSubsPromise = fetchExternalSubs(meta);
 
         // Resolve every dub embed in parallel -> master playlist + subtitle tracks.
         const resolved = await Promise.all(dubLangs.map(async (lang) => {
@@ -220,13 +231,36 @@ async function extractStreamUrl(url) {
             });
         });
 
+        // Await the overlapped lookup — by now it has usually already settled.
+        let externalSubs = [];
+        try { externalSubs = await externalSubsPromise; } catch (e) { externalSubs = []; }
+        externalSubs.forEach((sub) => {
+            if (!sub || !sub.url || seenSub.has(sub.url)) return;
+            seenSub.add(sub.url);
+            allSubtitles.push({
+                url: sub.url,
+                label: cleanText(sub.label || 'English'),
+                kind: 'captions',
+                headers: sub.headers || {},
+                isDefault: !!sub.isDefault
+            });
+        });
+
         const primary = pickPrimarySub(allSubtitles);
         const primaryUrl = primary ? primary.url : '';
+
+        // Emit both shapes — different clients read different keys (§7).
+        // English first: apps auto-load the first entry.
+        const subtitlePairs = [];
+        allSubtitles.forEach((s) => { subtitlePairs.push(s.label, s.url); });
+
         console.log('[AniDB-DUB] streams=' + streams.length + ' subs=' + allSubtitles.length);
         return JSON.stringify({
             streams: streams,
             subtitle: primaryUrl,
             subtitles: primaryUrl,
+            subtitlePairs: subtitlePairs,
+            subtitleHeaders: primary ? primary.headers : {},
             subtitlesHeaders: primary ? primary.headers : makeStreamHeaders(),
             allSubtitles: allSubtitles
         });
@@ -322,6 +356,130 @@ function resolveUrl(baseUrl, uri) {
     }
     const dir = base.replace(/[?#].*$/, '').replace(/\/[^/]*$/, '/');
     return dir + uri;
+}
+
+/* EXTERNAL SUBTITLES (OpenSubtitles REST, title-query variant) */
+
+// anidb never links IMDb (only MAL/AniList/AniDB/Kitsu), so the imdbid- path is
+// unavailable. OS REST also accepts a free-text title query, which keeps this
+// to a single request.
+const OS_REST = 'https://rest.opensubtitles.org/search';
+const OS_DL = 'https://dl.opensubtitles.org/en/download/filead/';
+
+// Dub audience wants signs/songs (a.k.a. forced / foreign-parts-only) tracks:
+// on-screen text and OP/ED lyrics, without full dialogue subtitles running over
+// English audio. This inverts the usual "skip forced tracks" rule, which assumes
+// a sub audience. Set false to prefer full dialogue instead.
+const PREFER_SIGNS_SONGS = true;
+
+// Release-name markers for signs/songs tracks, used when the API's
+// SubForeignPartsOnly flag is absent.
+// Underscores are word characters to \b, so use explicit separator classes.
+// Plural required: track labels use "Signs"/"Songs", whereas singular "Song"
+// commonly appears in show titles (e.g. "Song of the Sea").
+const SIGNS_SONGS_RE = /(?:^|[^a-z0-9])(s&s|forced|foreign[\s_.\-]*parts|signs|songs)(?:[^a-z0-9]|$)/i;
+
+// Pull slug + episode number back off the href written by extractEpisodes.
+function parseEpisodeMeta(url) {
+    const s = String(url || '');
+    const slug = extractFirst(s, /[?&]t=([^&]+)/);
+    const num = extractFirst(s, /[?&]n=(\d+)/);
+    return {
+        title: slug ? slugToTitle(decodeURIComponent(slug)) : '',
+        episode: num ? parseInt(num, 10) : 0
+    };
+}
+
+function slugToTitle(slug) {
+    return String(slug || '')
+        .replace(/-\d+$/, '')      // trailing anidb id
+        .replace(/-/g, ' ')
+        .trim();
+}
+
+// Single request, English only, no size-measuring downloads (that's the
+// expensive part of the reference pipeline and we skip it entirely).
+async function fetchExternalSubs(meta) {
+    try {
+        if (!meta || !meta.title || !meta.episode) return [];
+
+        const q = encodeURIComponent(meta.title).replace(/%20/g, '%20');
+        const url = `${OS_REST}/episode-${meta.episode}/query-${q}/sublanguageid-eng`;
+
+        const response = await soraFetch(url, {
+            headers: {
+                // Required by OS REST — it rejects requests without it.
+                'X-User-Agent': 'trailers.to-UA',
+                'Accept': 'application/json',
+                // The Sora bridge cannot decompress gzip/brotli.
+                'Accept-Encoding': 'identity'
+            }
+        });
+        if (!response) return [];
+
+        let rows;
+        try { rows = await response.json(); } catch (e) { return []; }
+        if (!Array.isArray(rows) || rows.length === 0) return [];
+
+        const scored = [];
+        rows.forEach((row) => {
+            if (!row || !row.IDSubtitleFile) return;
+            const name = row.SubFileName || '';
+            const parsed = parseSubEpisode(name);
+
+            // Episode validation (reference doc §5): a parsed code that
+            // disagrees with the request is dropped outright. Unparseable
+            // names are allowed but always lose to a verified match.
+            let epRank;
+            if (parsed && parsed.e === meta.episode) epRank = 2;     // verified
+            else if (parsed) return;                                 // blocked
+            else epRank = 1;                                         // unknown
+
+            // Signs/songs detection: trust the API flag first, fall back to
+            // the release name.
+            const flagged = String(row.SubForeignPartsOnly || '') === '1';
+            const isSignsSongs = flagged || SIGNS_SONGS_RE.test(name);
+
+            scored.push({
+                url: OS_DL + row.IDSubtitleFile,
+                label: isSignsSongs ? 'English (Signs & Songs)' : 'English',
+                epRank: epRank,
+                typeRank: PREFER_SIGNS_SONGS ? (isSignsSongs ? 1 : 0) : (isSignsSongs ? 0 : 1),
+                isSignsSongs: isSignsSongs,
+                name: name
+            });
+        });
+
+        if (scored.length === 0) return [];
+
+        // Preferred type outranks everything; correct episode breaks ties.
+        scored.sort((a, b) => (b.typeRank - a.typeRank) || (b.epRank - a.epRank));
+
+        const out = [];
+        const best = scored[0];
+        out.push({ url: best.url, label: best.label, headers: {}, isDefault: true, isSignsSongs: best.isSignsSongs });
+
+        // Also offer the opposite kind as a second pick, so full dialogue stays
+        // reachable from the picker if the signs track is sparse (or missing).
+        const alt = scored.find((s) => s.isSignsSongs !== best.isSignsSongs);
+        if (alt) out.push({ url: alt.url, label: alt.label, headers: {}, isDefault: false, isSignsSongs: alt.isSignsSongs });
+
+        console.log('[AniDB-DUB] ext sub: ' + best.label + ' ep=' + best.epRank + ' ' + best.name + (alt ? ' | alt: ' + alt.label : ' | no alt'));
+        return out;
+    } catch (e) {
+        console.log('External subs error: ' + e);
+        return [];
+    }
+}
+
+// Parse an s:e code out of a release name (reference doc §5).
+function parseSubEpisode(name) {
+    const n = String(name || '');
+    let m = n.match(/\bS(\d{1,2})[.\-_ ]?E(\d{1,3})\b/i); if (m) return { s: +m[1], e: +m[2] };
+    m = n.match(/\b(\d{1,2})x(\d{1,3})\b/i);              if (m) return { s: +m[1], e: +m[2] };
+    m = n.match(/\[(\d{1,2})\.(\d{1,3})\]/);              if (m) return { s: +m[1], e: +m[2] };
+    m = n.match(/(?:^|[\s\-_.])(\d)(\d{2})(?:[\s\-_.]|$)/); if (m) return { s: +m[1], e: +m[2] };
+    return null;
 }
 
 function isDub(lang) {
@@ -471,6 +629,12 @@ function parseBrowseCards(html) {
     });
 
     return results;
+}
+
+// anidb.app anime URLs are /anime/<slug>-<numericId>. Return the slug portion.
+function parseAnimeSlug(url) {
+    const m = String(url || '').match(/\/anime\/([^/?#]+)/i);
+    return m && m[1] ? m[1] : '';
 }
 
 // anidb.app anime URLs are /anime/<slug>-<numericId>. Return the numeric id.
